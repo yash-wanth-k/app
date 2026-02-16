@@ -103,6 +103,7 @@ jobs:
         shell: bash
         run: |
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "DRY RUN ${{ fromJSON(secrets.ALL_ENV_SECRETS)[needs.determine-tag.outputs.env].AWS_ACCESS_KEY_ID }} "
           echo "[DRY RUN] docker buildx build -t $REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL} backend"
           echo "[DRY RUN] docker buildx build -t $REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL} frontend"
           echo "[DRY RUN] docker push $REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL}"
