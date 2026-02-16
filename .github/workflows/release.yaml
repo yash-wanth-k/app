@@ -1,1 +1,121 @@
+name: Release
 
+on:
+  push:
+    tags:
+      - "dev-v*"
+      - "stage-v*"
+      - "prod-v*"
+  workflow_dispatch:
+    inputs:
+      ref_tag:
+        description: "Optional tag to parse (e.g. dev-v1.2.3) when running manually"
+        required: false
+        default: "dev-v0.0.0"
+      dry_run:
+        description: "Dry run (no pushes or real deploys)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Ensure 'true'/'false' string
+  DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true') && 'true' || 'false' }}
+
+jobs:
+  # ================== Parse Tag ==================
+  determine-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.parse.outputs.env }}
+      version: ${{ steps.parse.outputs.version }}
+      tag: ${{ steps.parse.outputs.tag }}
+    steps:
+      - name: Parse tag
+        id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_INPUT="${{ github.event.inputs.ref_tag }}"
+          if [[ -n "${TAG_INPUT}" ]]; then
+            TAG="${TAG_INPUT}"
+          else
+            TAG="${GITHUB_REF##*/}"
+          fi
+
+          # env = dev|stage|prod, version = 1.2.3 or 1.2.3.4
+          if [[ "${TAG}" =~ ^(dev|stage|prod)-v([0-9]+(\.[0-9]+){2,3})$ ]]; then
+            echo "env=${BASH_REMATCH[1]}"     >> "$GITHUB_OUTPUT"
+            echo "version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}"                  >> "$GITHUB_OUTPUT"
+            echo "Resolved tag: ${TAG} (env=${BASH_REMATCH[1]}, version=${BASH_REMATCH[2]})"
+          else
+            echo "Invalid tag ${TAG}. Expected dev|stage|prod-v<semver>"
+            exit 1
+          fi
+
+  # ================== Docker Build & Push Based on Tag Env ==================
+  docker-build-push:
+    runs-on: ubuntu-latest
+    needs: [determine-tag]
+    env:
+      ENV:        ${{ needs.determine-tag.outputs.env }}
+      VERSION:    ${{ needs.determine-tag.outputs.version }}
+      TAG_FULL:   ${{ needs.determine-tag.outputs.env }}-v${{ needs.determine-tag.outputs.version }}
+      # Non-sensitive values OK at job env
+      AWS_REGION:     ${{ fromJSON(secrets.ALL_ENV_SECRETS)[needs.determine-tag.outputs.env].AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ fromJSON(secrets.ALL_ENV_SECRETS)[needs.determine-tag.outputs.env].AWS_ACCOUNT_ID }}
+      FEED_INGEST_REPO:    ${{ fromJSON(secrets.ALL_ENV_SECRETS)[needs.determine-tag.outputs.env].ECR_REPO_FEED_INGEST }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Configure AWS credentials
+        if: env.DRY_RUN != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region:            ${{ env.AWS_REGION }}
+          aws-access-key-id:     ${{ fromJSON(secrets.ALL_ENV_SECRETS)[needs.determine-tag.outputs.env].AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ fromJSON(secrets.ALL_ENV_SECRETS)[needs.determine-tag.outputs.env].AWS_SECRET_ACCESS_KEY }}
+
+      - name: Login to Amazon ECR
+        if: env.DRY_RUN != 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push — DRY RUN
+        if: env.DRY_RUN == 'true'
+        shell: bash
+        run: |
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "[DRY RUN] docker buildx build -t $REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL} backend"
+          echo "[DRY RUN] docker buildx build -t $REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL} frontend"
+          echo "[DRY RUN] docker push $REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL}"
+          
+
+      - name: Build & Push images
+        if: env.DRY_RUN != 'true'
+        shell: bash
+        env:
+          REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+        run: |
+          set -euo pipefail
+          docker build -t "${FEED_INGEST_REPO}:${TAG_FULL}" .
+          docker tag "${FEED_INGEST_REPO}:${TAG_FULL}"  "$REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL}"
+          docker push "$REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL}"
+          echo "Pushed image: $REGISTRY/${FEED_INGEST_REPO}:${TAG_FULL}"
